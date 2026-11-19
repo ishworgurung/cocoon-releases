@@ -86,16 +86,26 @@ main() {
     mkdir -p "$dir" || die "cannot create $dir"
     [ -w "$dir" ] || die "$dir is not writable by you; set COCOON_INSTALL_DIR to a directory that is"
 
-    # The temporary directory is private and removed however this ends.
-    tmp=$(mktemp -d "${TMPDIR:-/tmp}/cocoon-install.XXXXXX") || die "cannot make a temporary directory"
+    # The download goes into a private directory next to its destination, not
+    # into /tmp: /tmp is often a RAM disk smaller than the binary (582 MB), and
+    # this way the space check below covers it and installing is a rename.
+    # The directory is removed however this ends.
+    tmp=$(mktemp -d "$dir/.cocoon-install.XXXXXX") || die "cannot make a temporary directory in $dir"
     trap 'rm -rf "$tmp"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
 
-    # The download is ~300 MB and unpacks to ~2 GB in the cache on first run.
+    # The binary is about 600 MB; its first run unpacks about 2.3 GB more into
+    # the cache (the root image and Claude Code's disk).
     free_kb=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2 {print $4}')
-    if [ -n "${free_kb:-}" ] && [ "$free_kb" -lt 1500000 ] 2>/dev/null; then
-        die "only $((free_kb / 1024)) MiB free in $dir; cocoon needs about 1.5 GiB to download and install"
+    if [ -n "${free_kb:-}" ] && [ "$free_kb" -lt 800000 ] 2>/dev/null; then
+        die "only $((free_kb / 1024)) MiB free in $dir; the download needs about 800 MiB"
+    fi
+    cache=${XDG_CACHE_HOME:-$HOME/.cache}
+    [ -d "$cache" ] || cache=$HOME
+    cache_kb=$(df -Pk "$cache" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "${cache_kb:-}" ] && [ "$cache_kb" -lt 3000000 ] 2>/dev/null; then
+        warn "only $((cache_kb / 1024)) MiB free for $cache; cocoon's first run unpacks about 2.3 GiB there"
     fi
 
     step "Downloading $name"
@@ -105,20 +115,23 @@ main() {
         *[!0-9a-f]*|"") die "$name.sha256 does not hold a SHA-256" ;;
     esac
     [ "${#want}" = 64 ] || die "$name.sha256 does not hold a SHA-256"
-    fetch_big "$base/$name" "$tmp/$name" || die "cannot fetch $base/$name"
+    rc=0
+    fetch_big "$base/$name" "$tmp/$name" || rc=$?
+    case $rc in
+        0) ;;
+        # curl 23 and wget 3: the download arrived but could not be written.
+        23|3) die "cannot write the download into $dir: is the disk full? ($(df -Ph "$dir" | awk 'NR==2 {print $4}') free)" ;;
+        *) die "cannot fetch $base/$name" ;;
+    esac
 
     step "Checking the SHA-256"
     got=$(sha "$tmp/$name")
     [ "$got" = "$want" ] || die "the download does not match its checksum (expected $want, got $got); nothing was installed"
 
-    # Rename into place: a cocoon already running keeps its old file, and a
-    # failure here leaves the previous install untouched.
+    # Rename into place, on the same file system: a cocoon already running
+    # keeps its old file, and a failure here leaves the previous install untouched.
     chmod 0755 "$tmp/$name"
-    new=$dir/.cocoon.new.$$
-    if ! cp "$tmp/$name" "$new" || ! mv -f "$new" "$dest"; then
-        rm -f "$new"
-        die "cannot write $dest"
-    fi
+    mv -f "$tmp/$name" "$dest" || die "cannot write $dest"
     say "    installed $dest"
 
     path_hint "$dir"
